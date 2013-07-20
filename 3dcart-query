@@ -1,0 +1,370 @@
+#!/usr/bin/python
+
+from suds.client import Client
+
+from urllib import urlretrieve
+from hashlib import sha256
+from tempfile import NamedTemporaryFile
+from time import sleep
+
+import os
+import sys
+import json
+import argparse
+import subprocess
+
+# The default URI for the 3dcart API
+tdc_url = 'http://api.3dcart.com/cart.asmx'
+
+# Pattern for the 3dcart API WSDL URIs (%s can be '' for the simple API or
+# '_advanced' for the advanced API)
+tdc_wsdl_pattern = 'http://api.3dcart.com/cart%s.asmx?WSDL'
+
+def cache_get(uri, cache_dir=None, hashes=None):
+    '''Gets a file from a cache directory or downloads it.  If 'hashes' is a
+       set() then cache_get() checks that the SHA-256 hash of the document
+       downloaded is in that set.'''
+    if uri.startswith('file:'):
+        return open(uri[5:])
+    if not cache_dir:
+        f = NamedTemporaryFile()
+        fname = f.name
+        urlretrieve(uri, f.name)
+    else:
+        fname = os.path.join(cache_dir, uri[uri.rindex('/') + 1:])
+        try:
+            f = open(fname)
+            sys.stderr.write('Found %s in %s\n' %(uri, f.name))
+        except:
+            sys.stderr.write('Retrieving %s into %s\n' %(uri, fname))
+            urlretrieve(uri, fname)
+            f = open(fname)
+    if hashes:
+        h = sha256(f.read()).hexdigest()
+        f.seek(0)
+        assert h in hashes
+    return f
+
+def resolve_wsdl(part, wsdl_dir=None, wsdl_hashes=None):
+    if part.startswith('http'):
+        uri = part
+    else:
+        uri = tdc_wsdl_pattern % (part,)
+    return cache_get(uri, wsdl_dir, wsdl_hashes)
+
+known_3dcart_wsdl_hashes = set(
+    ('1a4262d231df4972f93d21bff411fb5335d9188f3db0d4a29e809a2bf6410032',
+     '1f8417afb3fe2f9fdd0cccbd8d09e6edd072cd6a0a15ae48c7a896a490c270d6'))
+
+class ThreeDCartClient(object):
+    '''3dcart API client'''
+    def __init__(self, store, api_key, location=None, wsdl='',
+                 wsdl_dir=None, wsdl_hashes=None):
+        '''Create a client handle for the 3dcart API.  If 'wsdl' is defaulted
+           or '' then use the simple API, else use the specified API (must be
+           '_advanced' or the URI of the WSDL of the API desired).  'wsdl_dir',
+           if given, is a directory where to cache WSDL files.  'wsdl_hashes',
+           if given, is a set() of SHA-256 hashes of 3dcart API WSDL files, in
+           hex.  The 'store' is the store's 3dcartstores.com URI, and 'api_key'
+           is the store's API key.'''
+        if type(wsdl_hashes) == bool:
+            # Simple and advanced API WSDL hashes
+            wsdl_hashes = known_3dcart_wsdl_hashes
+        self.store = store
+        self.api_key = api_key
+        self.location = location or tdc_url
+        self.wsdl = resolve_wsdl(wsdl, wsdl_dir, wsdl_hashes)
+        self.client = Client(url='file://' + os.path.abspath(self.wsdl.name),
+                             location=self.location)
+
+    def op(self, opname):
+        '''Returns a callable object for the given operation name of the 3dcart
+           API.'''
+        method = getattr(self.client.service, opname)
+        def call_op(*args, **kw):
+            return method(self.store, self.api_key, *args, **kw)
+        return call_op
+
+class AnonObject(object):
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+def parse_product_name(product_name):
+    lines = product_name.split('\n')
+    assert lines[1].startswith('Send to:')
+    assert lines[2].startswith('E-mail:')
+    assert lines[3].startswith('Date to send:')
+    assert lines[4].startswith('Personalized Message:')
+    recv_name = ':'.join(lines[1].split(':')[2:])
+    recv_email = ':'.join(lines[2].split(':')[2:])
+    send_date = ':'.join(lines[3].split(':')[2:])
+    message = ':'.join(lines[4].split(':')[2:])
+    return AnonObject(product_name=lines[0],
+            recv_name=':'.join(lines[1].split(':')[2:]),
+            recv_email=':'.join(lines[2].split(':')[2:]),
+            send_date=':'.join(lines[3].split(':')[2:]),
+            message=':'.join(lines[4].split(':')[2:]))
+
+class ThreeDCartOrderProcessor(object):
+    def __init__(self, tdc_client, start_process, finish_process=None,
+                 check_status=None, no_update=False, verbose=False):
+        self.client = tdc_client
+        assert start_process
+        self.start_process = start_process
+        self.finish_process = finish_process
+        self.check_status = check_status
+        self.no_update = no_update
+        self.be_verbose = verbose
+        self.get_order_op = tdc_client.op('getOrder')
+        self.update_order_op = tdc_client.op('updateOrderStatus')
+
+    def verbose(self, msg, *args):
+        if self.be_verbose:
+            sys.stderr.write(msg %args + '\n')
+
+    def get_orders(self, idx, status='New', num=100):
+        orders = self.get_order_op(num, idx, True, status='New')
+        try:
+            if int(orders.Error.Id) == 49:
+                return None
+        except: pass
+        try:
+            if orders.GetOrdersResponse:
+                return orders
+        except: pass
+        raise(Exception('Unexpected response type for 3dcart getOrder API: %s'
+                        %(str(orders),)))
+
+    def update_order(self, invoice, status):
+        if self.no_update:
+            self.verbose('Would have updated invoice %s status to %s'
+                         %(invoice, status))
+            return True
+        self.verbose('Updating invoice %s status to %s' %(invoice, status))
+        try: self.update_order_op(invoice, status)
+        except Exception, e:
+            sys.stderr.write('Failed to update invoice %s status to %s: %s\n'
+                             %(invoice, status, str(e)))
+            return False
+        return True
+
+
+    def process_orders(self, process_order, from_state='New',
+                       to_state='Shipped'):
+        start=0
+        successes = []
+        failures = []
+        exceptions = []
+        while True:
+            orders = self.get_orders(start, status=from_state)
+            if not orders:
+                break
+            self.verbose('Looking at %d orders',
+                         len(orders.GetOrdersResponse.Order))
+            if len(orders.GetOrdersResponse.Order) == 0:
+                break
+            start += 100
+            fail_count = 0
+            # Process orders
+            for order in orders.GetOrdersResponse.Order:
+                # Process order
+                i = 0
+                # Set order state to "Processing"; we'll set it to "Shipped"
+                # when we've actually finished.
+                if from_state != 'Processing':
+                    self.update_order(order.InvoiceNumber, 'Processing')
+                for order_item in order.ShippingInformation.OrderItems:
+                    assert order_item[0] == 'Item'
+                    order_item = order_item[1]
+                    try:
+                        order_info = parse_product_name(order_item.ProductName)
+                    except:
+                        # Old orders
+                        continue
+                    try:
+                        ret = process_order(order.OrderID,
+                                            order.InvoiceNumber,
+                                            order.BillingAddress.Email,
+                                            order_item.ProductID,
+                                            order_info.product_name,
+                                            order_info.recv_name,
+                                            order_info.recv_email,
+                                            order_info.send_date,
+                                            order_info.message)
+                        if not ret:
+                            fail_count += 1
+                    except Exception, e:
+                        raise(e)
+                        self.verbose('Error processing order ID %s, invoice %s'
+                                     'order item #%d',
+                                     order.OrderID, order.InvoiceNumber, i)
+                        exceptions += (e,)
+                        fail_count += 1
+                    i += 1
+                if len(exceptions) > 0:
+                    failures += (order.InvoiceNumber,)
+                    # Failures -> reset state so we get another crack at
+                    # it later
+                    if from_state == 'New':
+                        self.update_order(order.InvoiceNumber, 'New')
+                    continue
+                successes += (order.InvoiceNumber,)
+                if to_state == 'Shipped':
+                    # Done with this order!
+                    self.update_order(order.InvoiceNumber, 'Shipped')
+            if fail_count == len(orders.GetOrdersResponse.Order):
+                break
+        return { 'successes': successes,
+                 'failures': failures,
+                 'exceptions': exceptions }
+
+    def go(self, poll_interval=30, num_at_once=10, attempts=-1):
+        while attempts != 0:
+            self.verbose('Checking on and processing orders')
+            if self.finish_process:
+                self.verbose('\tProcess orders: preparation')
+                self.process_orders(self.start_process, 'New', 'Processing')
+                self.verbose('\tProcess orders: completion')
+                self.process_orders(self.finish_process, 'Processing', 'Shipped')
+                if self.check_status:
+                    self.verbose('\tProcess orders: check')
+                    self.process_orders(self.check_status, 'Processing', 'Shipped')
+            else:
+                self.verbose('\tProcess orders')
+                if self.check_status:
+                    self.process_orders(self.start_process, 'New', 'Processing')
+                    self.verbose('\tCheck ordes')
+                    self.process_orders(self.check_status, 'Processing', 'Shipped')
+                else:
+                    self.process_orders(self.start_process, 'New', 'Shipped')
+            if attempts > 0:
+                attempts -= 1
+            self.verbose('Waiting %s seconds for more orders' %(poll_interval,))
+            sleep(poll_interval)
+        return 0
+
+def setup_argparse():
+    p = argparse.ArgumentParser(add_help=True,
+            description='This program is intended for automating order ' \
+            'processing for 3dcart stores.  You can specify a handler for ' \
+            'New orders, one for finishing orders still in Processing ' \
+            'state, and one for checking orders prior to committing them ' \
+            'to Shipped status.  By default orders are listed with no ' \
+            'processing.',
+            epilog='The external programs invoked by this utility should ' \
+            'accept a -n option (and --dry-run).  If the -j/--json option ' \
+            'is not used then the following positional arguments will be ' \
+            'passed: order ID, invoice ID, buyer\'s email address, ' \
+            'product ID, product name, recipient\'s name, recipient\'s ' \
+            'email address, send date, and personalized message.')
+    p.add_argument('-v', '--verbose', help='make processing verbose',
+            action='count', dest='verbose')
+    p.add_argument('-W', '--wsdl-cache-dir', default='/tmp/',
+            help='directory for WSDL file caching',
+            action='store', dest='wsdl_dir')
+    p.add_argument('-C', '--check-wsdl-hashes',
+            help='whether to authenticate the WSDL files',
+            action='count', dest='wsdl_hashes')
+    p.add_argument('-I', '--poll-interval', type=int, default=30,
+            help='how many seconds to wait between new order checking',
+            action='store', dest='poll_interval')
+    p.add_argument('-L', '--limit', type=int, default=-1,
+            help='how many times to check for new orders',
+            action='store', dest='limit')
+    p.add_argument('-p', '--process-order-status',
+            help='path to program to process order', action='store',
+            dest='processor')
+    p.add_argument('-f', '--finish-order-status',
+            help='path to program to finish processing an order',
+            action='store', dest='finisher')
+    p.add_argument('-c', '--check-order-status',
+            help='path to program to check order processing status',
+            action='store', dest='checker')
+    p.add_argument('-j', '--json',
+            help='pass order information as JSON to external processors',
+            action='count', dest='use_json')
+    p.add_argument('-N', '--no-update-status', help='don\'t update order status',
+            action='count', dest='no_update', default=False)
+    p.add_argument('-n', '--dry-run', default=False,
+            help='don\'t run processors, don\'t update order status',
+            action='count', dest='dry_run')
+    
+    p.add_argument('store', metavar='3dcart_store', nargs=1,
+            help='3dcart store URI', action='store')
+    p.add_argument('api_key', metavar='api_key', nargs=1, help='API key',
+            action='store')
+    return p
+
+def display_order(orderID, invoiceNumber, senderEmail, productID, productName,
+        recipientName, recipientEMail, sendDate, personalizedMessage):
+    sys.stdout.write('Would have processed this order: \n')
+    json.dump({'orderID':orderID,'invoiceNumber':invoiceNumber,
+        'senderEmail':senderEmail,'productID':productID,
+        'recipientName':recipientName,'recipientEMail':recipientEMail,
+        'sendDate':sendDate,'personalizedMessage':personalizedMessage },
+        sys.stdout, indent=4)
+    sys.stdout.write('\n')
+    return False
+
+def make_external_runner(ext, use_json=False, verbose=False, dry_run=False):
+    def run_external(*args):
+        cmd = [ext]
+        if dry_run:
+            cmd += ('-n')
+        cmd += args
+        if verbose:
+            sys.stderr.write('Running external command: %s\n'
+                             %(str(cmd),))
+        return subprocess.call(cmd, shell=False)
+    def run_external_json(orderID, invoiceNumber, senderEmail,
+                          productID, productName, recipientName,
+                          recipientEMail, sendDate, personalizedMessage):
+        cmd = [ext]
+        if dry_run:
+            cmd += ('-n')
+        if verbose:
+            sys.stderr.write('Running external command with order as JSON ' \
+                             'on stdin: \n\t%s\n' %(str(cmd),))
+        p = subprocess.Popen(cmd, shell=False, stdin=subprocess.PIPE)
+        p.communicate(json.dumps({'orderID':orderID,'invoiceNumber':invoiceNumber,
+            'senderEmail':senderEmail,'productID':productID,
+            'recipientName':recipientName,'recipientEMail':recipientEMail,
+            'sendDate':sendDate,'personalizedMessage':personalizedMessage }) + '\n')
+        p.stdin.close()
+        return p.wait() == 0
+    if use_json:
+        return run_external_json
+    return run_external
+
+def setup_processors(opts):
+    if opts.processor:
+        opts.processor = make_external_runner(opts.processor,
+                                              opts.use_json, opts.dry_run)
+    if opts.finisher:
+        opts.finisher = make_external_runner(opts.finisher,
+                                             opts.use_json, opts.dry_run)
+    if opts.checker:
+        opts.checker = make_external_runner(opts.checker, opts.use_json,
+                                            opts.dry_run)
+    if not opts.processor:
+        opts.processor = display_order
+
+def main():
+    opts = setup_argparse().parse_args()
+    setup_processors(opts)
+    tdc_client = ThreeDCartClient(opts.store, opts.api_key,
+                                  wsdl='', # simple API
+                                  wsdl_dir=opts.wsdl_dir,
+                                  wsdl_hashes=opts.wsdl_hashes)
+    if opts.verbose:
+        sys.stderr.write('Opened 3dcart SOAP API connection\n')
+    processor = ThreeDCartOrderProcessor(tdc_client,
+                                         opts.processor,
+                                         finish_process=opts.finisher,
+                                         check_status=opts.checker,
+                                         verbose=opts.verbose,
+                                         no_update=opts.dry_run or opts.no_update)
+    return processor.go(attempts=opts.limit, poll_interval=opts.poll_interval)
+
+if __name__ == '__main__':
+    sys.exit(main())

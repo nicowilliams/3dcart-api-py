@@ -1,0 +1,6 @@
+3dcart-api-py
+=============
+
+A simple suds-based client for automated order processing for 3dcart
+stores.
+
