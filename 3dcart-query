@@ -2,10 +2,11 @@
 
 from suds.client import Client
 
+from time import sleep
 from urllib import urlretrieve
 from hashlib import sha256
+from dateutil import parser
 from tempfile import NamedTemporaryFile
-from time import sleep
 
 import os
 import sys
@@ -95,14 +96,16 @@ def parse_product_name(product_name):
     assert lines[2].startswith('E-mail:')
     assert lines[3].startswith('Date to send:')
     assert lines[4].startswith('Personalized Message:')
-    recv_name = ':'.join(lines[1].split(':')[2:])
-    recv_email = ':'.join(lines[2].split(':')[2:])
     send_date = ':'.join(lines[3].split(':')[2:])
+    try:
+        date = parser.parse(send_date, fuzzy=True)
+    except:
+        date = send_date # shouldn't happen because of fuzzy=True
     message = ':'.join(lines[4].split(':')[2:])
     return AnonObject(product_name=lines[0],
             recv_name=':'.join(lines[1].split(':')[2:]),
             recv_email=':'.join(lines[2].split(':')[2:]),
-            send_date=':'.join(lines[3].split(':')[2:]),
+            send_date=date,
             message=':'.join(lines[4].split(':')[2:]))
 
 class ThreeDCartOrderProcessor(object):
